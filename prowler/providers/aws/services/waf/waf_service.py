@@ -7,6 +7,45 @@ from prowler.lib.scan_filters.scan_filters import is_resource_filtered
 from prowler.providers.aws.lib.service.service import AWSService
 
 
+def _iter_list_pages(client, operation_name, **kwargs):
+    """Yield every page of a WAF Classic list operation.
+
+    Global WAF publishes botocore paginators for these operations. WAF Regional
+    uses the same ``NextMarker`` contract, but its service model ships an empty
+    paginator map, so those calls are followed directly. A repeated marker is
+    treated as a loop and stops the walk.
+
+    Args:
+        client: WAF or WAF Regional boto3 client.
+        operation_name: Snake-case list operation, for example ``list_rules``.
+        **kwargs: Arguments forwarded to the operation, such as ``RuleGroupId``.
+
+    Yields:
+        One page of the list response.
+    """
+    if client.can_paginate(operation_name):
+        yield from client.get_paginator(operation_name).paginate(**kwargs)
+        return
+
+    seen_markers = set()
+    operation = getattr(client, operation_name)
+    request = dict(kwargs)
+    while True:
+        response = operation(**request)
+        yield response
+        next_marker = response.get("NextMarker")
+        if not next_marker:
+            return
+        if next_marker in seen_markers:
+            logger.error(
+                f"{client.meta.region_name} -- pagination loop detected at marker "
+                f"{next_marker} for {operation_name}"
+            )
+            return
+        seen_markers.add(next_marker)
+        request["NextMarker"] = next_marker
+
+
 class WAF(AWSService):
     def __init__(self, provider):
         # AWS WAF is available globally for CloudFront distributions, but you must use the Region US East (N. Virginia) to create your web ACL and any resources used in the web ACL, such as rule groups, IP sets, and regex pattern sets.
@@ -31,14 +70,15 @@ class WAF(AWSService):
     def _list_rules(self):
         logger.info("WAF - Listing Global Rules...")
         try:
-            for rule in self.client.list_rules().get("Rules", []):
-                arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rule/{rule['RuleId']}"
-                self.rules[arn] = Rule(
-                    arn=arn,
-                    id=rule.get("RuleId", ""),
-                    region=self.region,
-                    name=rule.get("Name", ""),
-                )
+            for page in _iter_list_pages(self.client, "list_rules"):
+                for rule in page.get("Rules", []):
+                    arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rule/{rule['RuleId']}"
+                    self.rules[arn] = Rule(
+                        arn=arn,
+                        id=rule.get("RuleId", ""),
+                        region=self.region,
+                        name=rule.get("Name", ""),
+                    )
 
         except Exception as error:
             logger.error(
@@ -66,14 +106,15 @@ class WAF(AWSService):
     def _list_rule_groups(self):
         logger.info("WAF - Listing Global Rule Groups...")
         try:
-            for rule_group in self.client.list_rule_groups().get("RuleGroups", []):
-                arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rulegroup/{rule_group['RuleGroupId']}"
-                self.rule_groups[arn] = RuleGroup(
-                    arn=arn,
-                    region=self.region,
-                    id=rule_group.get("RuleGroupId", ""),
-                    name=rule_group.get("Name", ""),
-                )
+            for page in _iter_list_pages(self.client, "list_rule_groups"):
+                for rule_group in page.get("RuleGroups", []):
+                    arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rulegroup/{rule_group['RuleGroupId']}"
+                    self.rule_groups[arn] = RuleGroup(
+                        arn=arn,
+                        region=self.region,
+                        id=rule_group.get("RuleGroupId", ""),
+                        name=rule_group.get("Name", ""),
+                    )
 
         except Exception as error:
             logger.error(
@@ -85,11 +126,14 @@ class WAF(AWSService):
             f"WAF - Listing activated rules in Global Rule Group {rule_group.name}..."
         )
         try:
-            for rule in self.client.list_activated_rules_in_rule_group(
-                RuleGroupId=rule_group.id
-            ).get("ActivatedRules", []):
-                rule_arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rule/{rule.get('RuleId', '')}"
-                rule_group.rules.append(self.rules[rule_arn])
+            for page in _iter_list_pages(
+                self.client,
+                "list_activated_rules_in_rule_group",
+                RuleGroupId=rule_group.id,
+            ):
+                for rule in page.get("ActivatedRules", []):
+                    rule_arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:rule/{rule.get('RuleId', '')}"
+                    rule_group.rules.append(self.rules[rule_arn])
 
         except Exception as error:
             logger.error(
@@ -99,18 +143,19 @@ class WAF(AWSService):
     def _list_web_acls(self):
         logger.info("WAF - Listing Global Web ACLs...")
         try:
-            for waf in self.client.list_web_acls()["WebACLs"]:
-                if not self.audit_resources or (
-                    is_resource_filtered(waf["WebACLId"], self.audit_resources)
-                ):
-                    arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:webacl/{waf['WebACLId']}"
-                    self.web_acls[arn] = WebAcl(
-                        arn=arn,
-                        name=waf["Name"],
-                        id=waf["WebACLId"],
-                        albs=[],
-                        region=self.region,
-                    )
+            for page in _iter_list_pages(self.client, "list_web_acls"):
+                for waf in page.get("WebACLs", []):
+                    if not self.audit_resources or (
+                        is_resource_filtered(waf["WebACLId"], self.audit_resources)
+                    ):
+                        arn = f"arn:{self.audited_partition}:waf:{self.region}:{self.audited_account}:webacl/{waf['WebACLId']}"
+                        self.web_acls[arn] = WebAcl(
+                            arn=arn,
+                            name=waf["Name"],
+                            id=waf["WebACLId"],
+                            albs=[],
+                            region=self.region,
+                        )
 
         except Exception as error:
             logger.error(
@@ -174,14 +219,15 @@ class WAFRegional(AWSService):
     def _list_rules(self, regional_client):
         logger.info("WAFRegional - Listing Regional Rules...")
         try:
-            for rule in regional_client.list_rules().get("Rules", []):
-                arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:rule/{rule['RuleId']}"
-                self.rules[arn] = Rule(
-                    arn=arn,
-                    id=rule.get("RuleId", ""),
-                    region=regional_client.region,
-                    name=rule.get("Name", ""),
-                )
+            for page in _iter_list_pages(regional_client, "list_rules"):
+                for rule in page.get("Rules", []):
+                    arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:rule/{rule['RuleId']}"
+                    self.rules[arn] = Rule(
+                        arn=arn,
+                        id=rule.get("RuleId", ""),
+                        region=regional_client.region,
+                        name=rule.get("Name", ""),
+                    )
         except Exception as error:
             logger.error(
                 f"{regional_client.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
@@ -207,14 +253,15 @@ class WAFRegional(AWSService):
     def _list_rule_groups(self, regional_client):
         logger.info("WAFRegional - Listing Regional Rule Groups...")
         try:
-            for rule_group in regional_client.list_rule_groups().get("RuleGroups", []):
-                arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:rulegroup/{rule_group['RuleGroupId']}"
-                self.rule_groups[arn] = RuleGroup(
-                    arn=arn,
-                    region=regional_client.region,
-                    id=rule_group.get("RuleGroupId", ""),
-                    name=rule_group.get("Name", ""),
-                )
+            for page in _iter_list_pages(regional_client, "list_rule_groups"):
+                for rule_group in page.get("RuleGroups", []):
+                    arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:rulegroup/{rule_group['RuleGroupId']}"
+                    self.rule_groups[arn] = RuleGroup(
+                        arn=arn,
+                        region=regional_client.region,
+                        id=rule_group.get("RuleGroupId", ""),
+                        name=rule_group.get("Name", ""),
+                    )
 
         except Exception as error:
             logger.error(
@@ -226,13 +273,14 @@ class WAFRegional(AWSService):
             f"WAFRegional - Listing activated rules in Rule Group {rule_group.name}..."
         )
         try:
-            for rule in (
-                self.regional_clients[rule_group.region]
-                .list_activated_rules_in_rule_group(RuleGroupId=rule_group.id)
-                .get("ActivatedRules", [])
+            for page in _iter_list_pages(
+                self.regional_clients[rule_group.region],
+                "list_activated_rules_in_rule_group",
+                RuleGroupId=rule_group.id,
             ):
-                rule_arn = f"arn:{self.audited_partition}:waf-regional:{rule_group.region}:{self.audited_account}:rule/{rule.get('RuleId', '')}"
-                rule_group.rules.append(self.rules[rule_arn])
+                for rule in page.get("ActivatedRules", []):
+                    rule_arn = f"arn:{self.audited_partition}:waf-regional:{rule_group.region}:{self.audited_account}:rule/{rule.get('RuleId', '')}"
+                    rule_group.rules.append(self.rules[rule_arn])
 
         except Exception as error:
             logger.error(
@@ -242,18 +290,19 @@ class WAFRegional(AWSService):
     def _list_web_acls(self, regional_client):
         logger.info("WAFRegional - Listing Regional Web ACLs...")
         try:
-            for waf in regional_client.list_web_acls()["WebACLs"]:
-                if not self.audit_resources or (
-                    is_resource_filtered(waf["WebACLId"], self.audit_resources)
-                ):
-                    arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:webacl/{waf['WebACLId']}"
-                    self.web_acls[arn] = WebAcl(
-                        arn=arn,
-                        name=waf["Name"],
-                        id=waf["WebACLId"],
-                        albs=[],
-                        region=regional_client.region,
-                    )
+            for page in _iter_list_pages(regional_client, "list_web_acls"):
+                for waf in page.get("WebACLs", []):
+                    if not self.audit_resources or (
+                        is_resource_filtered(waf["WebACLId"], self.audit_resources)
+                    ):
+                        arn = f"arn:{self.audited_partition}:waf-regional:{regional_client.region}:{self.audited_account}:webacl/{waf['WebACLId']}"
+                        self.web_acls[arn] = WebAcl(
+                            arn=arn,
+                            name=waf["Name"],
+                            id=waf["WebACLId"],
+                            albs=[],
+                            region=regional_client.region,
+                        )
 
         except Exception as error:
             logger.error(

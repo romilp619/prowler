@@ -1,6 +1,9 @@
 from unittest.mock import patch
 
 import botocore
+import pytest
+from botocore.stub import Stubber
+from moto import mock_aws
 
 from prowler.providers.aws.services.waf.waf_service import (
     WAF,
@@ -455,3 +458,331 @@ class Test_WAF_Service:
                 ],
             )
         ]
+
+
+# ListRules, ListRuleGroups, ListWebACLs and ListActivatedRulesInRuleGroup return at
+# most 100 items. A NextMarker means another page remains and must be requested back.
+SERVICE_CASES = [
+    pytest.param(WAF, "waf", id="global"),
+    pytest.param(WAFRegional, "waf-regional", id="regional"),
+]
+
+
+def _new_service(service_class):
+    return service_class(set_mocked_aws_provider([AWS_REGION_US_EAST_1]))
+
+
+def _inventory_client(service):
+    if isinstance(service, WAFRegional):
+        return service.regional_clients[AWS_REGION_US_EAST_1]
+    return service.client
+
+
+def _resource_arn(service_name, resource_type, resource_id):
+    return (
+        f"arn:aws:{service_name}:{AWS_REGION_US_EAST_1}:{AWS_ACCOUNT_NUMBER}:"
+        f"{resource_type}/{resource_id}"
+    )
+
+
+def _invoke_regional_or_global(service, method_name):
+    method = getattr(service, method_name)
+    if isinstance(service, WAFRegional):
+        method(_inventory_client(service))
+    else:
+        method()
+
+
+class Test_WAF_Pagination:
+    """Pagination of WAF Classic list calls for the global and regional clients."""
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_rules_includes_later_pages(self, service_class, service_name):
+        service = _new_service(service_class)
+        service.rules = {}
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_rules",
+                {
+                    "Rules": [{"RuleId": "rule-1", "Name": "rule-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_response(
+                "list_rules",
+                {"Rules": [{"RuleId": "rule-2", "Name": "rule-two"}]},
+                {"NextMarker": "page-two"},
+            )
+            _invoke_regional_or_global(service, "_list_rules")
+            stubber.assert_no_pending_responses()
+
+        assert sorted(service.rules) == sorted(
+            [
+                _resource_arn(service_name, "rule", "rule-1"),
+                _resource_arn(service_name, "rule", "rule-2"),
+            ]
+        )
+        assert service.rules[_resource_arn(service_name, "rule", "rule-2")].name == (
+            "rule-two"
+        )
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_rule_groups_includes_later_pages(self, service_class, service_name):
+        service = _new_service(service_class)
+        service.rule_groups = {}
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_rule_groups",
+                {
+                    "RuleGroups": [{"RuleGroupId": "group-1", "Name": "group-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_response(
+                "list_rule_groups",
+                {"RuleGroups": [{"RuleGroupId": "group-2", "Name": "group-two"}]},
+                {"NextMarker": "page-two"},
+            )
+            _invoke_regional_or_global(service, "_list_rule_groups")
+            stubber.assert_no_pending_responses()
+
+        assert sorted(service.rule_groups) == sorted(
+            [
+                _resource_arn(service_name, "rulegroup", "group-1"),
+                _resource_arn(service_name, "rulegroup", "group-2"),
+            ]
+        )
+        assert (
+            service.rule_groups[
+                _resource_arn(service_name, "rulegroup", "group-2")
+            ].name
+            == "group-two"
+        )
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_activated_rules_includes_later_pages(
+        self, service_class, service_name
+    ):
+        service = _new_service(service_class)
+        first_arn = _resource_arn(service_name, "rule", "rule-1")
+        second_arn = _resource_arn(service_name, "rule", "rule-2")
+        service.rules = {
+            first_arn: Rule(
+                arn=first_arn,
+                id="rule-1",
+                region=AWS_REGION_US_EAST_1,
+                name="rule-one",
+            ),
+            second_arn: Rule(
+                arn=second_arn,
+                id="rule-2",
+                region=AWS_REGION_US_EAST_1,
+                name="rule-two",
+            ),
+        }
+        rule_group = RuleGroup(
+            arn=_resource_arn(service_name, "rulegroup", "group-1"),
+            id="group-1",
+            region=AWS_REGION_US_EAST_1,
+            name="group-one",
+        )
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_activated_rules_in_rule_group",
+                {
+                    "ActivatedRules": [{"Priority": 1, "RuleId": "rule-1"}],
+                    "NextMarker": "page-two",
+                },
+                {"RuleGroupId": "group-1"},
+            )
+            stubber.add_response(
+                "list_activated_rules_in_rule_group",
+                {"ActivatedRules": [{"Priority": 2, "RuleId": "rule-2"}]},
+                {"RuleGroupId": "group-1", "NextMarker": "page-two"},
+            )
+            service._list_activated_rules_in_rule_group(rule_group)
+            stubber.assert_no_pending_responses()
+
+        assert [rule.id for rule in rule_group.rules] == ["rule-1", "rule-2"]
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_web_acls_includes_later_pages(self, service_class, service_name):
+        service = _new_service(service_class)
+        service.web_acls = {}
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_web_acls",
+                {
+                    "WebACLs": [{"WebACLId": "acl-1", "Name": "acl-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_response(
+                "list_web_acls",
+                {"WebACLs": [{"WebACLId": "acl-2", "Name": "acl-two"}]},
+                {"NextMarker": "page-two"},
+            )
+            _invoke_regional_or_global(service, "_list_web_acls")
+            stubber.assert_no_pending_responses()
+
+        assert sorted(service.web_acls) == sorted(
+            [
+                _resource_arn(service_name, "webacl", "acl-1"),
+                _resource_arn(service_name, "webacl", "acl-2"),
+            ]
+        )
+        assert (
+            service.web_acls[_resource_arn(service_name, "webacl", "acl-2")].name
+            == "acl-two"
+        )
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_web_acls_filters_audited_resources_on_every_page(
+        self, service_class, service_name
+    ):
+        service = _new_service(service_class)
+        service.web_acls = {}
+        service.audit_resources = ["acl-2"]
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_web_acls",
+                {
+                    "WebACLs": [{"WebACLId": "acl-1", "Name": "acl-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_response(
+                "list_web_acls",
+                {"WebACLs": [{"WebACLId": "acl-2", "Name": "acl-two"}]},
+                {"NextMarker": "page-two"},
+            )
+            _invoke_regional_or_global(service, "_list_web_acls")
+            stubber.assert_no_pending_responses()
+
+        assert list(service.web_acls) == [
+            _resource_arn(service_name, "webacl", "acl-2")
+        ]
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_rules_keeps_pages_read_before_an_error(
+        self, service_class, service_name
+    ):
+        service = _new_service(service_class)
+        service.rules = {}
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_rules",
+                {
+                    "Rules": [{"RuleId": "rule-1", "Name": "rule-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_client_error(
+                "list_rules",
+                service_error_code="Throttling",
+                expected_params={"NextMarker": "page-two"},
+            )
+            _invoke_regional_or_global(service, "_list_rules")
+            stubber.assert_no_pending_responses()
+
+        assert list(service.rules) == [_resource_arn(service_name, "rule", "rule-1")]
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_rules_continues_past_an_empty_page_when_a_marker_remains(
+        self, service_class, service_name
+    ):
+        service = _new_service(service_class)
+        service.rules = {}
+        client = _inventory_client(service)
+
+        with Stubber(client) as stubber:
+            stubber.add_response(
+                "list_rules",
+                {
+                    "Rules": [{"RuleId": "rule-1", "Name": "rule-one"}],
+                    "NextMarker": "page-two",
+                },
+                {},
+            )
+            stubber.add_response(
+                "list_rules",
+                {"Rules": [], "NextMarker": "page-three"},
+                {"NextMarker": "page-two"},
+            )
+            stubber.add_response(
+                "list_rules",
+                {"Rules": [{"RuleId": "rule-2", "Name": "rule-two"}]},
+                {"NextMarker": "page-three"},
+            )
+            _invoke_regional_or_global(service, "_list_rules")
+            stubber.assert_no_pending_responses()
+
+        assert sorted(service.rules) == sorted(
+            [
+                _resource_arn(service_name, "rule", "rule-1"),
+                _resource_arn(service_name, "rule", "rule-2"),
+            ]
+        )
+
+    @pytest.mark.parametrize("service_class,service_name", SERVICE_CASES)
+    @mock_aws
+    def test_list_rules_stops_when_next_marker_repeats(
+        self, service_class, service_name
+    ):
+        """A marker that never changes must not walk the list forever."""
+        service = _new_service(service_class)
+        service.rules = {}
+        client = _inventory_client(service)
+        calls = []
+
+        def list_rules(**kwargs):
+            calls.append(kwargs)
+            if len(calls) > 2:
+                raise AssertionError("pagination did not stop")
+            return {
+                "Rules": [{"RuleId": "rule-1", "Name": "rule-one"}],
+                "NextMarker": "loop-forever",
+            }
+
+        client.list_rules = list_rules
+
+        with patch(
+            "prowler.providers.aws.services.waf.waf_service.logger"
+        ) as mock_logger:
+            _invoke_regional_or_global(service, "_list_rules")
+
+        assert len(calls) == 2
+        assert list(service.rules) == [_resource_arn(service_name, "rule", "rule-1")]
+        error_messages = [
+            str(call.args[0]) for call in mock_logger.error.call_args_list
+        ]
+        if client.can_paginate("list_rules"):
+            assert any("PaginationError" in message for message in error_messages)
+        else:
+            assert any(
+                "pagination loop detected" in message for message in error_messages
+            )
